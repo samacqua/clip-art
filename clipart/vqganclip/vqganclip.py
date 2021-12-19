@@ -13,7 +13,6 @@ from torch.nn import functional as F
 from torchvision import transforms
 from torchvision.transforms import functional as TF
 from tqdm.notebook import tqdm
-from base64 import b64encode
 
 import clip
 import kornia.augmentation as K
@@ -23,6 +22,8 @@ from PIL import ImageFile, Image
 
 from urllib.request import urlopen
 import os
+
+from .helpers import download_pretrained_gan
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -203,28 +204,36 @@ def resize_image(image, out_size):
     size = round((area * ratio) ** 0.5), round((area / ratio) ** 0.5)
     return image.resize(size, Image.LANCZOS)
 
-def run(perceptor, prompt='a wonderful psychedelic trip', width=600, height=600, model='vqgan_imagenet_f16_16384', display_freq=50,
-        init_image=None, max_iterations=200, vqgan_checkpoint=None, step_size=0.1, exp_dir='vqgan_out'):
+
+def vqganclip(clip_model, prompt, width=600, height=600, num_iter=200, init_image=None, exp_dir='vqgan_out',
+              model='imagenet_16384', display_freq=50, step_size=0.1):
+
+    os.makedirs(exp_dir, exist_ok=True)
 
     # parse inputs
-    model_names = {"vqgan_imagenet_f16_16384": 'ImageNet 16384', "vqgan_imagenet_f16_1024": "ImageNet 1024",
-                   'vqgan_openimages_f16_8192': 'OpenImages 8912',
-                   "wikiart_1024": "WikiArt 1024", "wikiart_16384": "WikiArt 16384", "coco": "COCO-Stuff",
-                   "faceshq": "FacesHQ", "sflckr": "S-FLCKR"}
-    name_model = model_names[model]
+    # conf_paths = ["vqgan_imagenet_f16_16384", "vqgan_imagenet_f16_1024", "vqgan_openimages_f16_8192", "wikiart_1024", "wikiart_16384", "coco", "faceshq", "sflckr"]
+    model_to_paths = {
+        'imagenet_1024': ('vqgan_imagenet_f16_1024.yaml', 'vqgan_imagenet_f16_1024.ckpt'),
+        'imagenet_16384': ('vqgan_imagenet_f16_16384.yaml', 'vqgan_imagenet_f16_16384.ckpt'),
+        'wikiart_16384': ('wikiart_16384.yaml', 'wikiart_16384.ckpt')
+    }
+    assert model in model_to_paths, f'{model} not available. available models: {list(model_to_paths.keys())}'
+    vqgan_config, vqgan_checkpoint = model_to_paths[model]
+
+
+    if not (os.path.isfile(vqgan_config) and os.path.isfile(vqgan_checkpoint)):
+        download_pretrained_gan(model)
+
 
     prompts = [phrase.strip() for phrase in prompt.split("|")]
     if prompts == ['']:
         prompts = []
 
-    vqgan_config=f'{model}.yaml'
-    vqgan_checkpoint=f'{model}.ckpt'
-
     device = torch.device('cuda:0')
 
     model = load_vqgan_model(vqgan_config, vqgan_checkpoint).to(device)
 
-    cut_size = perceptor.visual.input_resolution
+    cut_size = clip_model.visual.input_resolution
 
     f = 2 ** (model.decoder.num_resolutions - 1)
     cutn = 32
@@ -274,22 +283,8 @@ def run(perceptor, prompt='a wonderful psychedelic trip', width=600, height=600,
 
     for prompt in prompts:
         txt, weight, stop = parse_prompt(prompt)
-        embed = perceptor.encode_text(clip.tokenize(txt).to(device)).float()
+        embed = clip_model.encode_text(clip.tokenize(txt).to(device)).float()
         pMs.append(Prompt(embed, weight, stop).to(device))
-
-    # for prompt in args.image_prompts:
-    #     path, weight, stop = parse_prompt(prompt)
-    #     img = Image.open(path)
-    #     pil_image = img.convert('RGB')
-    #     img = resize_image(pil_image, (sideX, sideY))
-    #     batch = make_cutouts(TF.to_tensor(img).unsqueeze(0).to(device))
-    #     embed = perceptor.encode_image(normalize(batch)).float()
-    #     pMs.append(Prompt(embed, weight, stop).to(device))
-
-    # for seed, weight in zip(args.noise_prompt_seeds, args.noise_prompt_weights):
-    #     gen = torch.Generator().manual_seed(seed)
-    #     embed = torch.empty([1, perceptor.visual.output_dim]).normal_(generator=gen)
-    #     pMs.append(Prompt(embed, weight).to(device))
 
     def synth(z):
         if vqgan_checkpoint == 'vqgan_openimages_f16_8192.ckpt':
@@ -308,7 +303,7 @@ def run(perceptor, prompt='a wonderful psychedelic trip', width=600, height=600,
 
     def ascend_txt(i):
         out = synth(z)
-        iii = perceptor.encode_image(normalize(make_cutouts(out))).float()
+        iii = clip_model.encode_image(normalize(make_cutouts(out))).float()
 
         result = []
 
@@ -343,46 +338,13 @@ def run(perceptor, prompt='a wonderful psychedelic trip', width=600, height=600,
         with tqdm() as pbar:
             while True:
                 train(i)
-                if i == max_iterations:
+                if i == num_iter:
                     break
                 i += 1
                 pbar.update()
     except KeyboardInterrupt:
         pass
 
-
-def gen_video(max_iterations=200, in_colab=False, exp_dir='vqgan_out'):
-    init_frame = 1 #This is the frame where the video will start
-    last_frame = max_iterations #You can change i to the number of the last frame you want to generate. It will raise an error if that number of frames does not exist.
-
-    min_fps = 10
-    max_fps = 60
-
-    total_frames = last_frame-init_frame
-
-    length = 15 #Desired time of the video in seconds
-
-    frames = []
-    tqdm.write('Generating video...')
-    for i in range(init_frame,last_frame): #
-        save_dir = os.path.join(exp_dir, str(i) + '.png')
-        frames.append(Image.open(save_dir))
-
-    #fps = last_frame/10
-    fps = np.clip(total_frames/length,min_fps,max_fps)
-
-    from subprocess import Popen, PIPE
-    p = Popen(['ffmpeg', '-y', '-f', 'image2pipe', '-vcodec', 'png', '-r', str(fps), '-i', '-', '-vcodec', 'libx264', '-r', str(fps), '-pix_fmt', 'yuv420p', '-crf', '17', '-preset', 'veryslow', 'video.mp4'], stdin=PIPE)
-
-    if in_colab:
-        for im in tqdm(frames):
-            im.save(p.stdin, 'PNG')
-        p.stdin.close()
-        p.wait()
-        mp4 = open('video.mp4','rb').read()
-        data_url = "data:video/mp4;base64," + b64encode(mp4).decode()
-        display.HTML("""
-        <video width=400 controls>
-              <source src="%s" type="video/mp4">
-        </video>
-        """ % data_url)
+    fnames = [os.path.join(exp_dir, str(i) + '.png') for i in range(num_iter)]
+    images = [Image.open(f) for f in fnames]
+    return images
