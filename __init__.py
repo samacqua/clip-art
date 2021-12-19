@@ -1,1 +1,0 @@
-from clipdraw import hello

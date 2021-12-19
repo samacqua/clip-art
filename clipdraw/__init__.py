@@ -1,1 +1,1 @@
-from clipdraw import hello
+from .clipdraw import *
